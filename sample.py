@@ -6,6 +6,7 @@ import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
+import time
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
@@ -79,11 +80,24 @@ if start.startswith('FILE:'):
         start = f.read()
 start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+input_tokens = x.shape[1]
+print(f"Input prompt tokens: {input_tokens}")
 
 # run generation
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
+
+            start_time = time.time()
             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+
+            end_time = time.time()
             print(decode(y[0].tolist()))
+
+            total_time = end_time - start_time
+            time_per_token = total_time / max_new_tokens
+
+            print(f"Total inference time: {total_time:.4f} seconds")
+            print(f"Time per output token: {time_per_token:.6f} seconds")
             print('---------------')
+
