@@ -86,7 +86,8 @@ class CausalSelfAttention(nn.Module):
             # mask shape should be (1,1,T_q,T_k)
             T_q = q.size(2)
             T_k = k.size(2)
-            mask = self.bias[:, :, :T_q, :T_k]
+            past_len = T_k - T_q
+            mask = self.bias[:, :, past_len:past_len + T_q, :T_k]
             att = att.masked_fill(mask == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
