@@ -146,7 +146,8 @@ out_dir = 'out' # ignored if init_from is not 'resume'
 prompt_kv_cache = {} # dictionary mapping prompt strings to their precomputed KV cache tensors
 prompts = [
     "Now I see the issue! The problem is that your generate function is using prefix_len incorrectly. When you have a prefix match and past_kv already contains the cached KV for the prefix, you should NOT process the prefix tokens again. But the current generate function logic doesn't handle this correctly.Let me fix the generate function to properly handle the prefix_len parameter when past_kv is provided:",
-    "Now I see the issue! The problem is that your generate function is using prefix_len incorrectly. When you have a prefix match and past_kv already contains the cached KV for the prefix, you should NOT process the prefix tokens again. But the current generate function logic doesn't handle this correctly.Let me fix the generate function to properly handle the prefix_len parameter when past_kv is provided:"
+    "Now I see the issue! The problem is that your ",
+    "I'll add a small helper to truncate cached KV tensors to the matched prefix length and use it before extending the cache. Applying a focused patch to the generate function should allow us to reuse the cached KV for the matched prefix and only compute KV for the remaining tokens, without reprocessing the entire prompt. This should significantly speed up generation when there are common prefixes between prompts."
 ]
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
