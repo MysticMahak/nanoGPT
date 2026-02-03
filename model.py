@@ -354,50 +354,71 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_kv_cache=True):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_kv_cache=True, past_kv=None, prefix_len=0):
         """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        Generate tokens with KV caching.
+        
+        Args:
+            idx: Input tokens (B, T)
+            max_new_tokens: Number of new tokens to generate
+            temperature: Sampling temperature
+            top_k: Top-k sampling parameter
+            use_kv_cache: Whether to use KV cache
+            past_kv: Existing KV cache (list of (k, v) tuples)
+            prefix_len: Number of tokens from idx that are already represented in past_kv
         """
         if not use_kv_cache:
-            # simple generation loop without KV cache: re-forward full context each step
-            for _ in range(max_new_tokens):
-                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-                logits, _ = self(idx_cond)
-                logits = logits[:, -1, :] / temperature
-                if top_k is not None:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = -float('Inf')
-                probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)
-                idx = torch.cat((idx, idx_next), dim=1)
-            return idx
-
-        # KV-cache enabled generation (default path)
-        past_kv = None
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            # For the very first step we may pass the full context so that the model builds initial cache.
-            if past_kv is None:
-                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-                logits, _, past_kv = self(idx_cond, past_kv=None, return_past=True)
+            # ... same as before
+            return idx, None
+        
+        B, T = idx.shape
+        device = idx.device
+        
+        # Initialize output with the prompt
+        out_idx = idx.clone()
+        
+        # Determine which tokens need processing
+        if past_kv is not None and prefix_len > 0:
+            # Some tokens are already cached
+            if prefix_len < T:
+                # Process remaining tokens
+                idx_new = idx[:, prefix_len:]
+                if idx_new.size(1) > 0:
+                    logits, _, past_kv = self(idx_new, past_kv=past_kv, return_past=True)
+                
+                # Current token for generation is last token of prompt
+                cur_token = idx[:, -1:]
             else:
-                # only pass the last token (the newest one) and reuse cached K/V
-                idx_cond = idx[:, -1:]
-                logits, _, past_kv = self(idx_cond, past_kv=past_kv, return_past=True)
-
-            # pluck the logits at the final step and scale by desired temperature
+                # Entire prompt is already cached
+                cur_token = idx[:, -1:] if T > 0 else torch.zeros((B, 1), dtype=torch.long, device=device)
+                
+                # Get logits for current position
+                logits, _, past_kv = self(cur_token, past_kv=past_kv, return_past=True)
+                
+                if T == 0:
+                    out_idx = cur_token.clone()
+        else:
+            # No cache or prefix_len=0, process entire prompt
+            idx_to_process = idx
+            if idx_to_process.size(1) > self.config.block_size:
+                idx_to_process = idx_to_process[:, -self.config.block_size:]
+            
+            logits, _, past_kv = self(idx_to_process, past_kv=past_kv, return_past=True)
+            cur_token = idx[:, -1:]
+        
+        # Generate new tokens
+        for _ in range(max_new_tokens):
+            logits, _, past_kv = self(cur_token, past_kv=past_kv, return_past=True)
             logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
+            
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
+            
             probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-
-        return idx
+            
+            out_idx = torch.cat((out_idx, idx_next), dim=1)
+            cur_token = idx_next
+        
+        return out_idx, past_kv
