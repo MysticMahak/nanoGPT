@@ -63,9 +63,9 @@ class CausalSelfAttention(nn.Module):
         new_kv_cache = (k, v)
         curr_T = k.size(1) # updated sequence length after concatenating with cache
 
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, curr_T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, curr_T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -74,7 +74,7 @@ class CausalSelfAttention(nn.Module):
         elif kv_cache:
             # Use cached keys and values for faster inference
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:curr_T] == 0, float('-inf'))
+            att = att.masked_fill(torch.ones_like(self.bias[:,:,:T,:curr_T]) == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -222,7 +222,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss, past_kv
+        return logits, loss, new_past_kv
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
