@@ -13,12 +13,7 @@ import matplotlib.pyplot as plt
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out' # ignored if init_from is not 'resume'
-#start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-prompt_kv_cache = {} # dictionary mapping prompt strings to their precomputed KV cache tensors
-prompts = [
-    "Now I see the issue! The problem is that your generate function is using prefix_len incorrectly. When you have a prefix match and past_kv already contains the cached KV for the prefix, you should NOT process the prefix tokens again. But the current generate function logic doesn't handle this correctly.Let me fix the generate function to properly handle the prefix_len parameter when past_kv is provided:",
-    "Now I see the issue! The problem is that your generate function is using prefix_len incorrectly. When you have a prefix match and past_kv already contains the cached KV for the prefix, you should NOT process the prefix tokens again. But the current generate function logic doesn't handle this correctly.Let me fix the generate function to properly handle the prefix_len parameter when past_kv is provided:"
-]
+start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
 temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
