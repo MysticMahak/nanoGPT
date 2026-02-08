@@ -190,10 +190,7 @@ class GPT(nn.Module):
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
 
-        if past_kv is None:
-            pos = torch.arange(0, t, device=device).unsqueeze(0)
-        else:
-            pos = torch.arange(pos_offset, pos_offset +t, device=device).unsqueeze(0)
+        pos = torch.arange(0, t, device=device).unsqueeze(0)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -202,8 +199,8 @@ class GPT(nn.Module):
 
         if not past_kv:
             past_kv = [None] * self.config.n_layer
-        elif not is_prefill:
-            x = x[:, [-1], :]
+
+        x = x[:, [-1], :]
 
         new_past_kv = []
 
