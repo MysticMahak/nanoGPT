@@ -118,7 +118,7 @@ class Block(nn.Module):
 
     def forward(self, x, past_kv=None):
 
-        attn, cache_elem = self.attn(self.ln_1(x), past_kv=past_kv)
+        attn, cache_elem = self.attn(self.ln_1(x), kv_cache=past_kv)
         x = x + attn
         x = x + self.mlp(self.ln_2(x))
         return x, cache_elem
