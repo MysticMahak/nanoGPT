@@ -10,10 +10,134 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+import time #Q1
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+def idx_to_tokens(idx):
+    # idx: (1, T) or (T,)
+    if isinstance(idx, torch.Tensor):
+        idx = idx.squeeze(0)
+        return idx.tolist()
+    return idx
+
+class RadixNode: #Q3
+    def __init__(self, tokens, parent=None):
+        self.tokens = tokens              # contiguous token list
+        self.parent = parent
+        self.children = []                # list of RadixNode
+        self.kvcache = None               # full KV up to this node
+        self.seq_len = 0                  # total tokens up to this node
+
+
+class RadixTree: #Q3
+    def __init__(self):
+        self.root = RadixNode(tokens=[])
+
+    def insert(self, idx):
+        tokens = idx_to_tokens(idx)
+        node = self.root
+        i = 0
+
+        while i < len(tokens):
+            matched = False
+            for child in node.children:
+                common = self._lcp(child.tokens, tokens[i:])
+                if common > 0:
+                    if common < len(child.tokens):
+                        # split node
+                        split = RadixNode(
+                            child.tokens[common:], parent=child
+                        )
+                        split.children = child.children
+                        split.kvcache = child.kvcache
+                        split.seq_len = child.seq_len
+
+                        child.tokens = child.tokens[:common]
+                        child.children = [split]
+                        child.kvcache = None
+
+                    node = child
+                    i += common
+                    matched = True
+                    break
+
+            if not matched:
+                new_node = RadixNode(tokens[i:], parent=node)
+                node.children.append(new_node)
+                return
+
+    def find_deepest(self, idx):
+        tokens = idx_to_tokens(idx)
+        node = self.root
+        i = 0
+
+        while i < len(tokens):
+            matched = False
+            for child in node.children:
+                if tokens[i:i+len(child.tokens)] == child.tokens:
+                    node = child
+                    i += len(child.tokens)
+                    matched = True
+                    break
+            if not matched:
+                break
+
+        return node
+
+    @staticmethod
+    def _lcp(a, b):
+        i = 0
+        while i < len(a) and i < len(b) and a[i] == b[i]:
+            i += 1
+        return i
+        
+    def print_tree_pretty(self):
+        self._print_pretty(self.root, "", True)
+
+    def _print_pretty(self, node, prefix, is_last):
+        connector = "└── " if is_last else "├── "
+    
+        if node.tokens:
+            print(prefix + connector + str(node.tokens))
+        else:
+            print(prefix + connector + "<ROOT>")
+    
+        new_prefix = prefix + ("    " if is_last else "│   ")
+    
+        for i, child in enumerate(node.children):
+            self._print_pretty(
+                child,
+                new_prefix,
+                i == len(node.children) - 1
+            )
+
+@torch.no_grad() #Q3
+def compute_all_kv(model, tree, device): #Q3
+    def dfs(node):
+        if node.parent is None:
+            node.kvcache = None
+            node.seq_len = 0
+        else:
+            idx = torch.tensor(
+                node.tokens,
+                device=device
+            ).unsqueeze(0)
+
+            _, _, node.kvcache = model(
+                idx,
+                kvcache=node.parent.kvcache,
+                pos_offset=node.parent.seq_len,
+                is_prefill=True
+            )
+            node.seq_len = node.parent.seq_len + len(node.tokens)
+
+        for child in node.children:
+            dfs(child)
+
+    dfs(tree.root)
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -42,39 +166,39 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = False
+        #self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') #Q1
+        self.flash=False #Q1
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x, kv_cache=None):
+    def forward(self, x, kvcache=None): #Q2
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
 
-        if kv_cache:
-            prev_k, prev_v = kv_cache
-            k = torch.cat((prev_k, k), dim=1)
-            v = torch.cat((prev_v, v), dim=1)
+        if kvcache: #Q2
+            prev_k,prev_v = kvcache #Q2
+            k = torch.cat([prev_k, k], dim=1) #Q2
+            v = torch.cat([prev_v, v], dim=1) #Q2
+            
+        new_kvcache= [k , v] #Q2    
+        curr_T= k.shape[1] #Q2
         
-        new_kv_cache = (k, v)
-        curr_T = k.size(1) # updated sequence length after concatenating with cache
-
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, curr_T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs) #Q2
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs) 
+        v = v.view(B, curr_T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs) #Q2
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        elif kv_cache:
-            # Use cached keys and values for faster inference
+        elif kvcache:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:curr_T] == 0, float('-inf'))
+            att = att.masked_fill(torch.ones_like(self.bias[:,:,:T,:curr_T]) == 0, float('-inf')) #Q2
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -89,7 +213,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y, new_kv_cache
+        return y, new_kvcache #Q2
 
 class MLP(nn.Module):
 
@@ -116,12 +240,12 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, past_kv=None):
-
-        attn, cache_elem = self.attn(self.ln_1(x), past_kv=past_kv)
+    def forward(self, x, kvcache=None):
+        #x = x + self.attn(self.ln_1(x)) #Q2
+        attn, cache_ele = self.attn(self.ln_1(x), kvcache=kvcache)
         x = x + attn
         x = x + self.mlp(self.ln_2(x))
-        return x, cache_elem
+        return x, cache_ele
 
 @dataclass
 class GPTConfig:
@@ -185,32 +309,37 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, past_kv=None, pos_offset=0, is_prefill=False):
+    def forward(self, idx, targets=None, kvcache=None, pos_offset=0, is_prefill=False): #Q3
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
 
-        if past_kv is None:
+        if kvcache is None: #Q3
             pos = torch.arange(0, t, device=device).unsqueeze(0)
         else:
-            pos = torch.arange(pos_offset, pos_offset +t, device=device).unsqueeze(0)
+            pos = torch.arange(
+                pos_offset,
+                pos_offset + t,
+                device=device
+            ).unsqueeze(0)
+        #pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        #for block in self.transformer.h: #Q2
+           # x = block(x) #Q2
+        if not kvcache: #Q2
+            kvcache = [None] * self.config.n_layer #Q2
+        elif not is_prefill: #Q3
+            x = x[:,[-1],:] #Q2
 
-        if not past_kv:
-            past_kv = [None] * self.config.n_layer
-        elif not is_prefill:
-            x = x[:, [-1], :]
-
-        new_past_kv = []
-
-        for block, past_kv_block in zip(self.transformer.h, past_kv):
-            x, cache_elem = block(x, past_kv=past_kv_block)
-            new_past_kv.append(cache_elem)
-
+        new_kvcache=[] #Q2
+        for block, kvcache_block in zip(self.transformer.h, kvcache): #Q2
+            x, cache_ele = block(x, kvcache=kvcache_block) #Q2
+            new_kvcache.append(cache_ele) #Q2
+            
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -222,7 +351,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss, past_kv
+        return logits, loss, new_kvcache #Q2
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -337,32 +466,76 @@ class GPT(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
-        Generate tokens with KV caching.
-        
-        Args:
-            idx: Input tokens (B, T)
-            max_new_tokens: Number of new tokens to generate
-            temperature: Sampling temperature
-            top_k: Top-k sampling parameter
-            use_kv_cache: Whether to use KV cache
-            past_kv: Existing KV cache (list of (k, v) tuples)
-            prefix_len: Number of tokens from idx that are already represented in past_kv
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
-        past_kv = None
+        token_time=[] #Q1
+        
+        kvcache=None #Q2
         for _ in range(max_new_tokens):
+            start=time.time() #Q1
             # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]        
-            logits, _, past_kv = self(idx_cond, past_kv=past_kv)
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            logits, _, kvcache = self(idx_cond,kvcache=kvcache) #Q2
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
-            
+            # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
-            
+            # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
+            end=time.time() #Q1
+            token_time.append(end-start) #Q1
 
+        avg_time_per_token=sum(token_time)/len(token_time) #Q1
+        print("Average time per token=",avg_time_per_token) #Q1
         return idx
+    #Q3    
+    def generate_batch_with_radix(self, batch_prompts, max_new_tokens, temperature=1.0, top_k=None):
+        
+        tree = RadixTree()
+
+        for x in batch_prompts:
+            tree.insert(x)
+            
+        #Computing kv caches for all the nodes in the tree #Q3
+        compute_all_kv(self, tree, device=batch_prompts[0].device) 
+
+        results = []
+        for idx in batch_prompts:
+
+            node = tree.find_deepest(idx)
+            kvcache = node.kvcache
+            token_time = []
+            for _ in range(max_new_tokens):
+                start=time.time() #Q1
+                # if the sequence context is growing too long we must crop it at block_size
+                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+                # forward the model to get the logits for the index in the sequence
+                logits, _, kvcache = self(idx_cond,kvcache=kvcache) #Q2
+                # pluck the logits at the final step and scale by desired temperature
+                logits = logits[:, -1, :] / temperature
+                # optionally crop the logits to only the top k options
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                # apply softmax to convert logits to (normalized) probabilities
+                probs = F.softmax(logits, dim=-1)
+                # sample from the distribution
+                idx_next = torch.multinomial(probs, num_samples=1)
+                # append sampled index to the running sequence and continue
+                idx = torch.cat((idx, idx_next), dim=1)
+                end=time.time() #Q1
+                token_time.append(end-start) #Q1
+    
+            avg_time_per_token=sum(token_time)/len(token_time) #Q1
+            print("Average time per token=",avg_time_per_token) #Q1
+            results.append(idx)
+        return results

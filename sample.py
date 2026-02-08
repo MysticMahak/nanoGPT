@@ -6,138 +6,9 @@ import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
-import time
 from model import GPTConfig, GPT
-from typing import Optional, Tuple, List
-
-
-def find_longest_prefix_match(prompt_tokens: List[int], cached_prompts: List[Tuple[int, ...]]) -> Optional[Tuple[int, Tuple[int, ...]]]:
-    """
-    Find the longest prefix match between the given prompt and cached prompts.
-    
-    Args:
-        prompt_tokens: List of token IDs for the current prompt
-        cached_prompts: List of cached prompt token tuples
-    
-    Returns:
-        Tuple of (prefix_length, cached_prompt_tuple) if a match is found, else None
-    """
-    if not cached_prompts:
-        return None
-    
-    best_match = None
-    best_match_len = 0
-    
-    for cached_prompt in cached_prompts:
-        # Find common prefix length
-        prefix_len = 0
-        for i in range(min(len(prompt_tokens), len(cached_prompt))):
-            if prompt_tokens[i] == cached_prompt[i]:
-                prefix_len += 1
-            else:
-                break
-        
-        # Update best match if this one is longer
-        if prefix_len > best_match_len and prefix_len > 0:
-            best_match_len = prefix_len
-            best_match = (prefix_len, cached_prompt)
-    
-    return best_match
-
-
-def _truncate_past_kv(past_kv, length: int):
-    """Return a version of past_kv where each layer's key/value time dimension is truncated to `length`."""
-    if past_kv is None:
-        return None
-    truncated = []
-    for layer in past_kv:
-        if layer is None:
-            truncated.append(None)
-            continue
-        k, v = layer
-        # shapes: (B, nh, T, hs)
-        if k is None or v is None:
-            truncated.append(None)
-        else:
-            truncated.append((k[:, :, :length, :].contiguous(), v[:, :, :length, :].contiguous()))
-    return truncated
-
-
-def generate_with_prefix_caching(
-    model: GPT,
-    prompt_tokens: torch.Tensor,
-    prompt_kv_cache: dict,
-    max_new_tokens: int,
-    temperature: float = 1.0,
-    top_k: Optional[int] = None,
-    device: str = 'cuda',
-) -> Tuple[torch.Tensor, dict]:
-    """
-    Generate tokens with intelligent prefix caching.
-    """
-    prompt_tuple = tuple(prompt_tokens[0].tolist())
-    cached_prompts = list(prompt_kv_cache.keys())
-    
-    # Try to find a prefix match
-    prefix_match = find_longest_prefix_match(list(prompt_tuple), cached_prompts)
-    
-    past_kv = None
-    start_pos = 0  # Renamed from prefix_len to be clearer
-    
-    if prefix_match is not None:
-        prefix_len, matched_cached_prompt = prefix_match
-        print(f"Found prefix match: {prefix_len}/{len(prompt_tuple)} tokens")
-        
-        # Retrieve the cached KV for the matching prefix
-        past_kv = prompt_kv_cache[matched_cached_prompt]
-        # If the cached prompt is longer than the matching prefix, truncate the cached KV
-        if len(matched_cached_prompt) > prefix_len:
-            past_kv = _truncate_past_kv(past_kv, prefix_len)
-        
-        # If the entire prompt is already cached, just use generation with the cache
-        if prefix_len == len(prompt_tuple):
-            print("Exact prompt match - reusing full KV cache")
-            start_pos = prefix_len  # All tokens are already in cache
-        else:
-            # We need to compute KV for the remaining tokens beyond the prefix
-            print(f"Reusing KV cache for first {prefix_len} tokens, computing for remaining {len(prompt_tuple) - prefix_len} tokens")
-            
-            # Here's the issue: we're processing the remaining tokens BEFORE generate
-            # So by the time we call generate, past_kv already has the full prompt
-            remaining_tokens = prompt_tokens[:, prefix_len:]
-            
-            # Forward pass for remaining tokens to extend the cache
-            with torch.no_grad():
-                _, _, past_kv = model(
-                    remaining_tokens.to(device),
-                    past_kv=past_kv,
-                    return_past=True,
-                )
-            
-            # Now past_kv contains KV for the ENTIRE prompt
-            start_pos = len(prompt_tuple)  # All prompt tokens are now cached
-    else:
-        print("No prefix match found - computing full KV cache")
-        start_pos = 0
-    
-    # Generate new tokens
-    # If start_pos == len(prompt_tuple), generate will skip processing prompt
-    # If start_pos == 0, generate will process the entire prompt
-    y, final_past_kv = model.generate(
-        prompt_tokens.to(device),
-        max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        use_kv_cache=True,
-        past_kv=past_kv,
-        prefix_len=start_pos,  # Pass how many tokens are already in past_kv
-    )
-    
-    # Cache the full prompt's final KV state
-    if prompt_tuple not in prompt_kv_cache:
-        prompt_kv_cache[prompt_tuple] = final_past_kv
-    
-    return y, final_past_kv
+import time
+import matplotlib.pyplot as plt
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
@@ -152,7 +23,6 @@ num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
 temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
 top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
-use_kv_cache = True # toggle KV caching on/off for generation
 seed = 1337
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
@@ -211,50 +81,62 @@ else:
     decode = lambda l: enc.decode(l)
 
 # encode the beginning of the prompt
-#if start.startswith('FILE:'):
-#    with open(start[5:], 'r', encoding='utf-8') as f:
-#        start = f.read()
-#start_ids = encode(start)
-#x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-#input_tokens = x.shape[1]
-#print(f"Input prompt tokens: {input_tokens}")
+if start.startswith('FILE:'):
+    with open(start[5:], 'r', encoding='utf-8') as f:
+        start = f.read()
+start_ids = encode(start)
+x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
-encoded_prompts = [
-    torch.tensor(encode(p), dtype=torch.long)[None, ...]
-    for p in prompts
-]
-
-# run generation
-with torch.no_grad():
-    with ctx:
-        for i, x in enumerate(encoded_prompts):
-            x = x.to(device)
-            print(f"\n=== Prompt {i+1}/{len(encoded_prompts)} ===")
-            print(f"Prompt: {prompts[i]}")
-            print(f"Prompt length: {x.shape[1]} tokens")
-            
+def collect(max_new_tokens):
+    # run generation
+    with torch.no_grad():
+        with ctx:
+            average_time = 0.0
             for k in range(num_samples):
                 start_time = time.time()
-                
-                # Use the new prefix caching function
-                y, past_kv = generate_with_prefix_caching(
-                    model=model,
-                    prompt_tokens=x,
-                    prompt_kv_cache=prompt_kv_cache,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_k=top_k,
-                    device=device,
-                )
-
-                end_time = time.time()
-                print(f"\n[Sample {k+1}/{num_samples}]")
+                y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
                 print(decode(y[0].tolist()))
-
-                total_time = end_time - start_time
-                time_per_token = total_time / max_new_tokens
-
-                print(f"Total inference time: {total_time:.4f} seconds")
-                print(f"Time per output token: {time_per_token:.6f} seconds")
                 print('---------------')
 
+                total_time = time.time() - start_time
+                average_time += total_time
+                average_time_per_token = total_time / max_new_tokens
+
+            average_time /= num_samples
+
+    return average_time, average_time_per_token
+
+if __name__ == '__main__':
+    max_new_tokens_list = [10, 50, 100, 200]
+    times = []
+    times_per_token = []
+    for max_new_tokens in max_new_tokens_list:
+        print(f"Collecting data for max_new_tokens={max_new_tokens}...")
+        avg_time, avg_time_per_token = collect(max_new_tokens)
+        times.append(avg_time)
+        times_per_token.append(avg_time_per_token)
+
+        print(f"Average time per token: {avg_time:.6f} seconds")
+
+    # Plotting the results
+    plt.figure(figsize=(10, 4))
+    plt.plot(max_new_tokens_list, times, marker='o')
+    plt.title('Average Time per Token vs Max New Tokens')
+    plt.xlabel('Max New Tokens')
+    plt.ylabel('Average Time per Token (seconds)')
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.grid(True)
+    plt.savefig('my_plot.png')
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(max_new_tokens_list, times_per_token, marker='o')
+    plt.title('Average Time per Token vs Max New Tokens')
+    plt.xlabel('Max New Tokens')
+    plt.ylabel('Average Time per Token (seconds)')
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.grid(True)
+    plt.savefig('my_plot1.png')
+
+            
