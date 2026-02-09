@@ -24,7 +24,7 @@ class RadixNode:
     def __init__(self, tokens, parent=None):
         self.tokens = tokens
         self.parent = parent
-        self.children = {}
+        self.children = []
         self.kvcache = None
         self.seq_len = 0
 
