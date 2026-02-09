@@ -16,7 +16,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 def idx_to_tokens(idx):
-    if isinstance(idx, torch.tensor):
+    if isinstance(idx, torch.Tensor):
         idx = idx.squeeze().tolist()
     return idx
 
@@ -488,5 +488,5 @@ class GPT(nn.Module):
                 # append sampled index to the running sequence and continue
                 idx = torch.cat((idx, idx_next), dim=1)
             results.append(idx)
-            
+
         return results
