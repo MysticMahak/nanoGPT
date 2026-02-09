@@ -289,7 +289,7 @@ class GPT(nn.Module):
         if kvcache is None:
             kvcache = [None] * self.config.n_layer
         else:
-            x = x[:, [-1] :] # if using a kv cache, we only feed in the most recent token (the rest is in the cache)
+            x = x[:, [-1], :] # if using a kv cache, we only feed in the most recent token (the rest is in the cache)
 
         new_kvcache = []
     
