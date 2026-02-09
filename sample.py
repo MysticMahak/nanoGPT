@@ -1,137 +1,154 @@
 """
-Sample from a trained model
+Sample from a trained model with Radix KV cache
 """
 import os
 import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
-from model import GPTConfig, GPT
 import time
-import matplotlib.pyplot as plt
+
+from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
-init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'out' # ignored if init_from is not 'resume'
-start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-num_samples = 10 # number of samples to draw
-max_new_tokens = 500 # number of tokens generated in each sample
-temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
-top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
+init_from = 'resume'
+out_dir = 'out'
+
+num_samples = 1
+max_new_tokens = 200
+temperature = 0.8
+top_k = 200
 seed = 1337
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-compile = False # use PyTorch 2.0 to compile the model to be faster
-exec(open('configurator.py').read()) # overrides from command line or config file
+device = 'cuda'
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+compile = False
+exec(open('configurator.py').read())
 # -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Large shared system prompt (~150 tokens)
+# -----------------------------------------------------------------------------
+SYSTEM_PROMPT = """
+You are an advanced language model trained to write detailed, coherent,
+and stylistically consistent fantasy narratives. You are especially good
+at continuing stories that share a common opening, tone, and worldbuilding.
+You should reuse context efficiently, avoid contradictions, and produce
+rich descriptions of characters, settings, and events. Always maintain
+a consistent narrative voice and avoid repeating the same phrases too often.
+The story should unfold naturally and creatively.
+""".strip()
+
+SYSTEM_PROMPT *= 2
+
+PROMPTS = [
+    SYSTEM_PROMPT + "\n\nOnce upon a time in a distant kingdom, there lived a wise old king",
+    SYSTEM_PROMPT + "\n\nOnce upon a time in a distant kingdom, there lived a brave young knight",
+    SYSTEM_PROMPT + "\n\nOnce upon a time in a distant kingdom, there lived a clever merchant",
+    SYSTEM_PROMPT + "\n\nOnce upon a time in a distant kingdom, the people believed that magic",
+    SYSTEM_PROMPT + "\n\nOnce upon a time in a distant kingdom, the people feared the return of",
+]
 
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+device_type = 'cuda' if 'cuda' in device else 'cpu'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# model
+# -----------------------------------------------------------------------------
+# Load model
+# -----------------------------------------------------------------------------
 if init_from == 'resume':
-    # init from a model saved in a specific directory
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     gptconf = GPTConfig(**checkpoint['model_args'])
     model = GPT(gptconf)
+
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
+    for k, v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+
     model.load_state_dict(state_dict)
+
 elif init_from.startswith('gpt2'):
-    # init from a given GPT-2 model
     model = GPT.from_pretrained(init_from, dict(dropout=0.0))
 
-model.eval()
-model.to(device)
-if compile:
-    model = torch.compile(model) # requires PyTorch 2.0 (optional)
+model.eval().to(device)
 
-# look for the meta pickle in case it is available in the dataset folder
+if compile:
+    model = torch.compile(model)
+
+# -----------------------------------------------------------------------------
+# Tokenizer
+# -----------------------------------------------------------------------------
 load_meta = False
-if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']: # older checkpoints might not have these...
+if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']:
     meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')
     load_meta = os.path.exists(meta_path)
+
 if load_meta:
-    print(f"Loading meta from {meta_path}...")
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
-    # TODO want to make this more general to arbitrary encoder/decoder schemes
     stoi, itos = meta['stoi'], meta['itos']
     encode = lambda s: [stoi[c] for c in s]
     decode = lambda l: ''.join([itos[i] for i in l])
 else:
-    # ok let's assume gpt-2 encodings by default
-    print("No meta.pkl found, assuming GPT-2 encodings...")
     enc = tiktoken.get_encoding("gpt2")
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)
 
-# encode the beginning of the prompt
-if start.startswith('FILE:'):
-    with open(start[5:], 'r', encoding='utf-8') as f:
-        start = f.read()
-start_ids = encode(start)
-x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+# -----------------------------------------------------------------------------
+# Run generation
+# -----------------------------------------------------------------------------
+start_time = time.time()
 
-def collect(max_new_tokens):
-    # run generation
-    with torch.no_grad():
-        with ctx:
-            average_time = 0.0
-            for k in range(num_samples):
-                start_time = time.time()
-                y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-                print(decode(y[0].tolist()))
-                print('---------------')
+with torch.no_grad():
+    with ctx:
+        xes = []
+        for i, prompt in enumerate(PROMPTS):
+            start_ids = encode(prompt)
+            x = torch.tensor(start_ids, dtype=torch.long, device=device)[None, :]
+            xes.append(x)
 
-                total_time = time.time() - start_time
-                average_time += total_time
-                average_time_per_token = total_time / max_new_tokens
+        print(f"\nStarting batch generation with {len(PROMPTS)} prompts...")
+        outputs = model.generate_batch_with_radix(
+            batch_prompts=xes,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        )
 
-            average_time /= num_samples
+end_time = time.time()
+print(f"\n=== Total Execution Time ===")
+print(f"Total time: {end_time - start_time:.2f}s")
 
-    return average_time, average_time_per_token
-
-if __name__ == '__main__':
-    max_new_tokens_list = [10, 50, 100, 200]
-    times = []
-    times_per_token = []
-    for max_new_tokens in max_new_tokens_list:
-        print(f"Collecting data for max_new_tokens={max_new_tokens}...")
-        avg_time, avg_time_per_token = collect(max_new_tokens)
-        times.append(avg_time)
-        times_per_token.append(avg_time_per_token)
-
-        print(f"Average time per token: {avg_time:.6f} seconds")
-
-    # Plotting the results
-    plt.figure(figsize=(10, 4))
-    plt.plot(max_new_tokens_list, times, marker='o')
-    plt.title('Average Time per Token vs Max New Tokens')
-    plt.xlabel('Max New Tokens')
-    plt.ylabel('Average Time per Token (seconds)')
-    plt.xscale('log')
-    plt.yscale('log')
-    plt.grid(True)
-    plt.savefig('my_plot.png')
-
-    plt.figure(figsize=(10, 4))
-    plt.plot(max_new_tokens_list, times_per_token, marker='o')
-    plt.title('Average Time per Token vs Max New Tokens')
-    plt.xlabel('Max New Tokens')
-    plt.ylabel('Average Time per Token (seconds)')
-    plt.xscale('log')
-    plt.yscale('log')
-    plt.grid(True)
-    plt.savefig('my_plot1.png')
-
-            
+# Display the generated outputs
+print(f"\n=== Generated Outputs ===")
+for i, output in enumerate(outputs):
+    # Get the full sequence (prompt + generated)
+    full_sequence = output[0].tolist()
+    
+    # Get the prompt tokens (original input)
+    prompt_tokens = xes[i][0].tolist()
+    prompt_length = len(prompt_tokens)
+    
+    # Separate prompt and generated parts
+    generated_tokens = full_sequence[prompt_length:]
+    
+    # Decode both parts
+    prompt_text = decode(prompt_tokens)
+    generated_text = decode(generated_tokens)
+    
+    print(f"\nPrompt {i+1}:")
+    print(f"  Input: '{prompt_text}'")
+    print(f"  Generated: '{generated_text}'")
+    print(f"  Total tokens: {len(full_sequence)} (prompt: {prompt_length}, generated: {len(generated_tokens)})")
+    
+    # Optionally, show the full output
+    full_text = decode(full_sequence)
+    print(f"  Full output: '{full_text}'")
+    print("-" * 80)
