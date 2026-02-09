@@ -466,9 +466,9 @@ class GPT(nn.Module):
         compute_kvs(self, tree, batch_prompts[0].device)
         results = []
 
-        for prompt in batch_prompts:
+        for idx in batch_prompts:
 
-            node = tree.match(prompt)
+            node = tree.match(idx)
             kv_cache = node.kvcache
             for _ in range(max_new_tokens):
                 # if the sequence context is growing too long we must crop it at block_size
