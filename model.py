@@ -15,6 +15,99 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+def idx_to_tokens(idx):
+    if isinstance(idx, torch.Tensor):
+        idx = idx.squeeze().tolist()
+        return idx
+    
+class RadixNode:
+    def __init__(self, tokens, parent=None):
+        self.tokens = tokens
+        self.parent = parent
+        self.children = []
+        self.kvcache = None
+        self.seq_len = 0
+
+class RadixTree:
+    def __init__(self):
+        self.root = RadixNode(tokens=[])
+
+    def insert(self, idx):
+        tokens = idx_to_tokens(idx)
+        node = self.root
+        i = 0
+
+        while i < len(tokens):
+            matched = False
+            for child in node.children:
+                common = self._lcp(tokens[i:], child.tokens)
+                if common > 0:
+                    if common < len(child.tokens):
+                        # split the child node
+                        split = RadixNode(tokens=child.tokens[common:], parent=child)
+                        split.children = child.children
+                        split.kvcache = child.kvcache
+                        split.seq_len = child.seq_len
+
+                        child.tokens = child.tokens[:common]
+                        child.children = [split]
+                        child.kvcache = None
+
+                    node = child
+                    i += common
+                    matched = True
+                    break
+            
+            if not matched:
+                new_node = RadixNode(tokens=tokens[i:], parent=node)
+                node.children.append(new_node)
+                return
+    
+    def match(self, idx):
+        tokens = idx_to_tokens(idx)
+        node = self.root
+        i = 0
+
+        while i < len(tokens):
+            matched = False
+            for child in node.children:
+                if tokens[i:i+len(child.tokens)] == child.tokens:
+                    node = child
+                    i += len(child.tokens)
+                    matched = True
+                    break
+            if not matched:
+                break
+
+        return node
+    
+    def _lcp(self, a, b):
+        i = 0
+        while i < min(len(a), len(b)) and a[i] == b[i]:
+            i += 1
+        return i
+
+@torch.no_grad() 
+def compute_kvs(model, tree, device):
+    def dfs(node):
+        if node.parent is None:
+            node.kvcache = None
+            node.seq_len = 0
+        else:
+            idx = torch.tensor(
+                node.tokens,
+                device=device
+            ).unsqueeze(0)
+
+            _, _, node.kvcache = model(idx, kvcache=node.parent.kvcache, pos_offset=node.parent.seq_len, is_prefill=True)
+
+            node.seq_len = node.parent.seq_len + len(node.tokens)
+
+        for child in node.children:
+            dfs(child)
+    
+    dfs(tree.root)
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -49,19 +142,33 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, kvcache=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        if kvcache is not None:
+            prev_k, prev_v = kvcache
+            k = torch.concat((prev_k, k), dim=1)
+            v = torch.concat((prev_v, v), dim=1)
+
+        new_kvcache = (k, v)
+        curr_T = k.size(1)
+        k = k.view(B, curr_T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, curr_T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        elif kvcache is not None:
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(torch.ones_like(self.bias[:,:,:T,:curr_T]) == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -73,7 +180,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, new_kvcache
 
 class MLP(nn.Module):
 
@@ -100,10 +207,11 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, kvcache=None):
+        attn_out, cache_elem = self.attn(self.ln_1(x), kvcache=kvcache)
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, cache_elem
 
 @dataclass
 class GPTConfig:
@@ -167,7 +275,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, kvcache=None, pos_offset=0, is_prefill=False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -175,10 +283,20 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        pos_emb = self.transformer.wpe(pos + pos_offset) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+
+        if kvcache is None:
+            kvcache = [None] * self.config.n_layer
+        else:
+            x = x[:, [-1] :] # if using a kv cache, we only feed in the most recent token (the rest is in the cache)
+
+        new_kvcache = []
+    
+        for block, kvc in zip(self.transformer.h, kvcache):
+            x, cache_elem = block(x, kvcache=kvc)
+            new_kvcache.append(cache_elem)
+
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -190,7 +308,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return logits, loss, new_kvcache
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -309,11 +427,12 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        kv_cache = None
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _, kv_cache = self(idx_cond, kvcache=kv_cache)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
