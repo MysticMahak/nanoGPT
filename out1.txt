@@ -1,30 +1,3 @@
-Overriding: init_from = gpt2
-Overriding: max_new_tokens = 50
-2026-02-09 08:47:11.121435: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:467] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
-WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-E0000 00:00:1770626831.143766     179 cuda_dnn.cc:8579] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
-E0000 00:00:1770626831.150370     179 cuda_blas.cc:1407] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
-W0000 00:00:1770626831.167609     179 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
-W0000 00:00:1770626831.167639     179 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
-W0000 00:00:1770626831.167642     179 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
-W0000 00:00:1770626831.167646     179 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
-loading weights from pretrained gpt: gpt2
-forcing vocab_size=50257, block_size=1024, bias=True
-overriding dropout rate to 0.0
-WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0
-WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0
-WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0
-WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0
-WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0
-WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0
-WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0
-WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0
-WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0
-WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0
-WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0
-WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0
-number of parameters: 123.65M
-No meta.pkl found, assuming GPT-2 encodings...
 Collecting data for max_new_tokens=10...
 But your manual KV path does not exactly match Flash Attention semantics. This can cause tiny numerical differences that compound during generation. Not the main issue — but worth knowing.
 
