@@ -16,6 +16,98 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+def idx_to_tokens(idx):
+    if isinstance(idx, torch.Tensor):
+        idx = idx.squeeze().tolist()
+    
+    return idx
+    
+class RadixNode:
+    def __init__(self, tokens, parent=None):
+        self.tokens = tokens
+        self.parent = parent
+        self.children = []
+        self.kvcache = None
+        self.seq_len = 0
+
+class RadixTree:
+    def __init__(self):
+        self.root = RadixNode(tokens=[])
+    
+    def insert(self, idx):
+        node = self.root
+        tokens = idx_to_tokens(idx)
+        i = 0
+
+        while i < len(tokens):
+            matched = False
+            for child in node.children:
+                common = self._lcp(child.tokens, tokens[i:])
+                if common > 0:
+                    if common < len(child.tokens):
+
+                        split = RadixNode(tokens=child.tokens[common:], parent=child)
+                        split.children = child.children
+                        split.kvcache = child.kvcache
+                        split.seq_len = child.seq_len
+
+                        child.tokens = child.tokens[:common]
+                        child.children = [split]
+                        child.kvcache = None
+
+                    node = child
+                    i += common
+                    matched = True
+                    break
+            
+            if not matched:
+                new_node = RadixNode(tokens=tokens[i:], parent=node)
+                node.children.append(new_node)
+                return
+            
+    def match(self, idx):
+        node = self.root
+        tokens = idx_to_tokens(idx)
+        i = 0
+
+        while i < len(tokens):
+            matched = False
+            for child in node.children:
+                if tokens[i:i+len(child.tokens)] == child.tokens:
+                    node = child
+                    i += len(child.tokens)
+                    matched = True
+                    break
+            if not matched:
+                break
+
+        return node
+
+    def _lcp(self, a, b):
+        i = 0
+        while i < min(len(a), len(b)) and a[i] == b[i]:
+            i += 1
+        return i
+            
+@torch.no_grad()
+def compute_kvs(model, tree, device):
+    def dfs(node):
+        if node.parent is None:
+            node.kvcache = None
+            node.seq_len = 0
+        else:
+            idx = torch.tensor(node.tokens, dtype=torch.long, device=device).unsqueeze(0)
+
+            _, _, kv_cache = model(idx, targets=None, kv_cache=node.parent.kvcache, pos_offset=node.parent.seq_len, is_prefill=True)
+
+            node.kvcache = kv_cache
+            node.seq_len = node.parent.seq_len + len(node.tokens)
+
+            for child in node.children:
+                dfs(child)
+        
+    dfs(tree.root)
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -168,18 +260,32 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, kv_cache=None, pos_offset=0, is_prefill=False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
+        if kv_cache is None:
+            pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
+        else:
+            pos = torch.arange(pos_offset, pos_offset + t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
+
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+
+        if kv_cache is None:
+            kv_cache = [None] * self.config.n_layer
+        elif not is_prefill:
+            x = x[:, -1:, :] # if using a kv cache, only the last token gets fed forward at each step (see generate function), so crop context to that
+        
+        new_kv_cache = []
+        for block, kv_cache_block in zip(self.transformer.h, kv_cache):
+            x, new_kv_cache_block = block(x, kv_cache=kv_cache_block)
+            new_kv_cache.append(new_kv_cache_block)
+
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -191,7 +297,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return logits, loss, new_kv_cache
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -333,3 +439,41 @@ class GPT(nn.Module):
             average_time += curr_time
 
         return idx, average_time / max_new_tokens
+    
+    def generate_batch_with_radix(self, batch_prompts, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        tree = RadixTree()
+        for prompt in batch_prompts:
+            tree.insert(prompt)
+        
+        compute_kvs(self, tree, batch_prompts[0].device)
+        results = []
+
+        for idx in batch_prompts:
+            node = tree.match(idx)
+            kv_cache = node.kvcache
+            
+            for _ in range(max_new_tokens):
+                # if the sequence context is growing too long we must crop it at block_size
+                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+                # forward the model to get the logits for the index in the sequence
+                logits, _, kv_cache = self(idx_cond, kvcache=kv_cache)
+                # pluck the logits at the final step and scale by desired temperature
+                logits = logits[:, -1, :] / temperature
+                # optionally crop the logits to only the top k options
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                # apply softmax to convert logits to (normalized) probabilities
+                probs = F.softmax(logits, dim=-1)
+                # sample from the distribution
+                idx_next = torch.multinomial(probs, num_samples=1)
+                # append sampled index to the running sequence and continue
+                idx = torch.cat((idx, idx_next), dim=1)
+            results.append(idx)
+
+        return results
